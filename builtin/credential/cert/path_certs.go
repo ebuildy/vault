@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-secure-stdlib/parseutil"
 	"github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/tokenutil"
@@ -308,6 +309,7 @@ func (b *backend) pathCertRead(ctx context.Context, req *logical.Request, d *fra
 		"ocsp_servers_override":        cert.OcspServersOverride,
 		"ocsp_fail_open":               cert.OcspFailOpen,
 		"ocsp_query_all_servers":       cert.OcspQueryAllServers,
+		"ocsp_max_age":                 cert.OcspMaxAge,
 	}
 	cert.PopulateTokenData(data)
 
@@ -365,6 +367,13 @@ func (b *backend) pathCertWrite(ctx context.Context, req *logical.Request, d *fr
 	}
 	if ocspQueryAll, ok := d.GetOk("ocsp_query_all_servers"); ok {
 		cert.OcspQueryAllServers = ocspQueryAll.(bool)
+	}
+	if ocspMaxAge, ok := d.GetOk("ocsp_max_age"); ok {
+		maxAgeDuration, err := parseutil.ParseDurationSecond(ocspMaxAge)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse ocsp_max_age: %w", err)
+		}
+		cert.OcspMaxAge = maxAgeDuration
 	}
 	if displayNameRaw, ok := d.GetOk("display_name"); ok {
 		cert.DisplayName = displayNameRaw.(string)
@@ -516,6 +525,7 @@ type CertEntry struct {
 	OcspServersOverride []string
 	OcspFailOpen        bool
 	OcspQueryAllServers bool
+	OcspMaxAge          time.Duration
 }
 
 const pathCertHelpSyn = `

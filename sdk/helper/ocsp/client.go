@@ -164,11 +164,17 @@ func (c *Client) getHashAlgorithmFromOID(target pkix.AlgorithmIdentifier) crypto
 
 // isInValidityRange checks the validity times of the OCSP response making sure
 // that thisUpdate and nextUpdate values are bounded within currTime
-func isInValidityRange(currTime time.Time, ocspRes *ocsp.Response) bool {
+func isInValidityRange(currTime time.Time, maxThisUpdate time.Duration, ocspRes *ocsp.Response) bool {
 	thisUpdate := ocspRes.ThisUpdate
 
 	// If the thisUpdate value in the OCSP response wasn't set fail this check
 	if thisUpdate.IsZero() || thisUpdate.After(currTime) {
+		return false
+	}
+
+	// If passed in a value for maxThisUpdate make sure that the response's
+	// ThisUpdate time isn't older than that max duration
+	if maxThisUpdate > 0 && currTime.Sub(thisUpdate) > maxThisUpdate {
 		return false
 	}
 
@@ -227,7 +233,7 @@ func (c *Client) encodeCertIDKey(certIDKeyBase64 string) (*certIDKey, error) {
 	}, nil
 }
 
-func (c *Client) checkOCSPResponseCache(encodedCertID *certIDKey, subject, issuer *x509.Certificate) (*ocspStatus, error) {
+func (c *Client) checkOCSPResponseCache(encodedCertID *certIDKey, subject, issuer *x509.Certificate, config *VerifyConfig) (*ocspStatus, error) {
 	c.ocspResponseCacheLock.RLock()
 	var cacheValue *ocspCachedResponse
 	v, ok := c.ocspResponseCache.Get(*encodedCertID)
@@ -236,7 +242,7 @@ func (c *Client) checkOCSPResponseCache(encodedCertID *certIDKey, subject, issue
 	}
 	c.ocspResponseCacheLock.RUnlock()
 
-	status, err := c.extractOCSPCacheResponseValue(cacheValue, subject, issuer)
+	status, err := c.extractOCSPCacheResponseValue(cacheValue, subject, issuer, config)
 	if err != nil {
 		return nil, err
 	}
@@ -253,13 +259,13 @@ func (c *Client) deleteOCSPCache(encodedCertID *certIDKey) {
 	c.ocspResponseCacheLock.Unlock()
 }
 
-func validateOCSP(ocspRes *ocsp.Response) (*ocspStatus, error) {
+func validateOCSP(conf *VerifyConfig, ocspRes *ocsp.Response) (*ocspStatus, error) {
 	curTime := time.Now()
 
 	if ocspRes == nil {
 		return nil, errors.New("OCSP Response is nil")
 	}
-	if !isInValidityRange(curTime, ocspRes) {
+	if !isInValidityRange(curTime, conf.OcspMaxAge, ocspRes) {
 		return &ocspStatus{
 			code: ocspInvalidValidity,
 			err:  fmt.Errorf("invalid validity: producedAt: %v, thisUpdate: %v, nextUpdate: %v", ocspRes.ProducedAt, ocspRes.ThisUpdate, ocspRes.NextUpdate),
@@ -468,7 +474,7 @@ func (c *Client) retryOCSP(
 
 // GetRevocationStatus checks the certificate revocation status for subject using issuer certificate.
 func (c *Client) GetRevocationStatus(ctx context.Context, subject, issuer *x509.Certificate, conf *VerifyConfig) (*ocspStatus, error) {
-	status, ocspReq, encodedCertID, err := c.validateWithCache(subject, issuer)
+	status, ocspReq, encodedCertID, err := c.validateWithCache(subject, issuer, conf)
 	if err != nil {
 		return nil, err
 	}
@@ -528,7 +534,7 @@ func (c *Client) GetRevocationStatus(ctx context.Context, subject, issuer *x509.
 				return nil
 			}
 
-			ret, err := validateOCSP(ocspRes)
+			ret, err := validateOCSP(conf, ocspRes)
 			if err != nil {
 				errors[i] = err
 				return err
@@ -631,6 +637,7 @@ type VerifyConfig struct {
 	OcspServersOverride []string
 	OcspFailureMode     FailOpenMode
 	QueryAllServers     bool
+	OcspMaxAge          time.Duration
 }
 
 // VerifyLeafCertificate verifies just the subject against it's direct issuer
@@ -716,12 +723,12 @@ func (c *Client) canEarlyExitForOCSP(results []*ocspStatus, chainSize int, conf 
 	return nil
 }
 
-func (c *Client) validateWithCacheForAllCertificates(verifiedChains []*x509.Certificate) (bool, error) {
+func (c *Client) validateWithCacheForAllCertificates(verifiedChains []*x509.Certificate, config *VerifyConfig) (bool, error) {
 	n := len(verifiedChains) - 1
 	for j := 0; j < n; j++ {
 		subject := verifiedChains[j]
 		issuer := verifiedChains[j+1]
-		status, _, _, err := c.validateWithCache(subject, issuer)
+		status, _, _, err := c.validateWithCache(subject, issuer, config)
 		if err != nil {
 			return false, err
 		}
@@ -732,7 +739,7 @@ func (c *Client) validateWithCacheForAllCertificates(verifiedChains []*x509.Cert
 	return true, nil
 }
 
-func (c *Client) validateWithCache(subject, issuer *x509.Certificate) (*ocspStatus, []byte, *certIDKey, error) {
+func (c *Client) validateWithCache(subject, issuer *x509.Certificate, config *VerifyConfig) (*ocspStatus, []byte, *certIDKey, error) {
 	ocspReq, err := ocsp.CreateRequest(subject, issuer, &ocsp.RequestOptions{})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create OCSP request from the certificates: %v", err)
@@ -741,7 +748,7 @@ func (c *Client) validateWithCache(subject, issuer *x509.Certificate) (*ocspStat
 	if ocspS.code != ocspSuccess {
 		return nil, nil, nil, fmt.Errorf("failed to extract CertID from OCSP Request: %v", err)
 	}
-	status, err := c.checkOCSPResponseCache(encodedCertID, subject, issuer)
+	status, err := c.checkOCSPResponseCache(encodedCertID, subject, issuer, config)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -749,7 +756,7 @@ func (c *Client) validateWithCache(subject, issuer *x509.Certificate) (*ocspStat
 }
 
 func (c *Client) GetAllRevocationStatus(ctx context.Context, verifiedChains []*x509.Certificate, conf *VerifyConfig) ([]*ocspStatus, error) {
-	_, err := c.validateWithCacheForAllCertificates(verifiedChains)
+	_, err := c.validateWithCacheForAllCertificates(verifiedChains, conf)
 	if err != nil {
 		return nil, err
 	}
@@ -774,11 +781,11 @@ func (c *Client) verifyPeerCertificateSerial(conf *VerifyConfig) func(_ [][]byte
 	}
 }
 
-func (c *Client) extractOCSPCacheResponseValueWithoutSubject(cacheValue ocspCachedResponse) (*ocspStatus, error) {
-	return c.extractOCSPCacheResponseValue(&cacheValue, nil, nil)
+func (c *Client) extractOCSPCacheResponseValueWithoutSubject(cacheValue ocspCachedResponse, conf *VerifyConfig) (*ocspStatus, error) {
+	return c.extractOCSPCacheResponseValue(&cacheValue, nil, nil, conf)
 }
 
-func (c *Client) extractOCSPCacheResponseValue(cacheValue *ocspCachedResponse, subject, issuer *x509.Certificate) (*ocspStatus, error) {
+func (c *Client) extractOCSPCacheResponseValue(cacheValue *ocspCachedResponse, subject, issuer *x509.Certificate, conf *VerifyConfig) (*ocspStatus, error) {
 	subjectName := "Unknown"
 	if subject != nil {
 		subjectName = subject.Subject.CommonName
@@ -800,7 +807,7 @@ func (c *Client) extractOCSPCacheResponseValue(cacheValue *ocspCachedResponse, s
 		}, nil
 	}
 
-	return validateOCSP(&ocsp.Response{
+	return validateOCSP(conf, &ocsp.Response{
 		ProducedAt: time.Unix(int64(cacheValue.producedAt), 0).UTC(),
 		ThisUpdate: time.Unix(int64(cacheValue.thisUpdate), 0).UTC(),
 		NextUpdate: time.Unix(int64(cacheValue.nextUpdate), 0).UTC(),
